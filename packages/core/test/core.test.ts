@@ -365,6 +365,38 @@ describe('vault migrations', () => {
     reopened.close();
   });
 
+  it('preserves v11 mailbox observations while allowing identical IDs in a different account', () => {
+    const legacy = new SQL.Database();
+    for (const migration of MIGRATIONS.filter((item) => item.version <= 11)) {
+      legacy.run(migration.sql);
+      legacy.run('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)', [
+        migration.version,
+        migration.name,
+        NOW,
+      ]);
+      legacy.run(`PRAGMA user_version=${migration.version}`);
+    }
+    legacy.run(
+      `INSERT INTO mail_events(id,provider,provider_message_id,direction,kind,sender_address,occurred_at,metadata_json,created_at)
+      VALUES('old-mail','google','same-provider-id','inbound','message','sender@example.test',?,?,?)`,
+      [NOW, JSON.stringify({ accountEmail: 'Owner@Example.test' }), NOW],
+    );
+    const bytes = legacy.export();
+    legacy.close();
+    const migrated = new CoreVault(SQL, { bytes, appliedAt: LATER });
+    expect(migrated.scalar("SELECT account_email FROM mail_events WHERE id='old-mail'")).toBe(
+      'owner@example.test',
+    );
+    migrated.run(
+      `INSERT INTO mail_events(id,provider,account_email,provider_message_id,direction,kind,sender_address,occurred_at,created_at)
+      VALUES('second-mail','google','second@example.test','same-provider-id','inbound','message','sender@example.test',?,?)`,
+      [NOW, NOW],
+    );
+    expect(migrated.scalar('SELECT count(*) FROM mail_events')).toBe(2);
+    expect(migrated.integrityCheck().ok).toBe(true);
+    migrated.close();
+  });
+
   it('migrates a v6 vault with footer settings unset and revokes legacy active approvals', () => {
     const legacy = new SQL.Database();
     for (const migration of MIGRATIONS.filter((item) => item.version <= 6)) {
@@ -743,12 +775,13 @@ describe('approval and send safety', () => {
     core.close();
   });
 
-  it('enforces one lifetime reservation per person and per normalized email', () => {
+  it('enforces one lifetime initial reservation per person and per normalized email', () => {
     const { vault: core, repository } = repositoryWithFounder();
     addFirmAndPeople(repository);
     message(repository, 'message-1', 'person-1', 'Partner@Calm.Example');
     repository.approveMessage('message-1', NOW, { approvalId: 'approval-1' });
     repository.reserveApprovedSend('message-1', 'google', 'ada@local.test', LATER, 'send-1');
+    repository.markSendSucceeded('send-1', 'sent-initial', LATER);
 
     repository.upsertContactMethod({
       id: 'contact-person-1-alt',
@@ -1069,7 +1102,7 @@ describe('approval and send safety', () => {
     domain.vault.close();
   });
 
-  it('enforces initial-only sends and makes automatic safety suppressions immutable', () => {
+  it('rejects unverified follow-ups and makes automatic safety suppressions immutable', () => {
     const { vault: core, repository } = repositoryWithFounder();
     addFirmAndPeople(repository);
     repository.createMessageDraft({
@@ -1087,7 +1120,9 @@ describe('approval and send safety', () => {
       createdAt: NOW,
       updatedAt: NOW,
     });
-    repository.approveMessage('message-follow-up', NOW, { approvalId: 'approval-follow-up' });
+    expect(() =>
+      repository.approveMessage('message-follow-up', NOW, { approvalId: 'approval-follow-up' }),
+    ).toThrow(/verified reply parent/i);
     expect(() =>
       repository.reserveApprovedSend(
         'message-follow-up',
@@ -1096,7 +1131,7 @@ describe('approval and send safety', () => {
         LATER,
         'send-follow-up',
       ),
-    ).toThrow(/initial outreach only/i);
+    ).toThrow(/verified reply parent/i);
 
     repository.addSuppression({
       id: 'suppression-unsubscribe',
@@ -1148,6 +1183,7 @@ describe('approval and send safety', () => {
 
     const base = {
       operationKey: 'send:reconcile-exact',
+      senderAddress: 'ada@local.test',
       provider: 'google' as const,
       providerMessageId: 'gmail-confirmed-message',
       providerThreadId: 'gmail-confirmed-thread',
@@ -1196,6 +1232,7 @@ describe('approval and send safety', () => {
     repository.markDispatchStarted('send:unconfirmed', '2026-07-31T12:05:01.000Z');
     const exact = {
       operationKey: 'send:unconfirmed',
+      senderAddress: 'ada@local.test',
       provider: 'google' as const,
       providerMessageId: 'provider-message',
       providerThreadId: null,
@@ -1214,6 +1251,7 @@ describe('approval and send safety', () => {
         recipientAddresses: ['partner@calm.example', 'copied@example.test'],
       },
       { ...exact, subject: 'Different subject' },
+      { ...exact, senderAddress: 'another-mailbox@example.test' },
       { ...exact, occurredAt: '2026-07-31T11:59:00.000Z' },
       { ...exact, occurredAt: '2026-09-01T12:05:02.000Z' },
       { ...exact, reconciledAt: '2026-07-31T11:59:00.000Z' },

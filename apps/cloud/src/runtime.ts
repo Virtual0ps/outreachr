@@ -11,7 +11,7 @@ import {
 } from '../../desktop/src/main/connector-service';
 import { VaultService } from '../../desktop/src/main/vault-service';
 import type { AgentEvent, CommandMap, CommandResultMap } from '../../desktop/src/shared/contracts';
-import { withWorkspaceLock } from './database';
+import { transaction, withWorkspaceLock } from './database';
 import { CloudError, requireCondition } from './errors';
 import type { ElizaClient } from './eliza';
 import { MailboxStore, mailboxConnectorId } from './mailboxes';
@@ -21,6 +21,8 @@ import { isAdmin } from './plans';
 import type { Session } from './sessions';
 import { FileStore } from './files';
 import { z } from 'zod';
+import { recoverCloudAgentResults } from './agent-recovery';
+import { exportCloudArchive, restoreCloudArchive } from './archive';
 
 const READ_COMMANDS = new Set<keyof CommandMap>([
   'investor.get',
@@ -192,6 +194,7 @@ export class CloudRuntime {
           await vault.persist();
         }
         const context = { client, directory, vault, organization, session, identity };
+        await recoverCloudAgentResults(context);
         const connectors = new ConnectorService({
           vault,
           secureStore: new DelegatedCredentialStore(
@@ -264,8 +267,12 @@ export class CloudRuntime {
       session,
       identity,
       orgId,
-      async ({ organization, client, directory }, command) => {
-        if (!READ_COMMANDS.has(name))
+      async (context, command) => {
+        const { organization, client, directory } = context;
+        if (
+          !READ_COMMANDS.has(name) &&
+          !(name === 'knowledge.remove' && organization.role !== 'viewer')
+        )
           requireCondition(
             entitlement(organization, new Date()).canEdit,
             403,
@@ -279,6 +286,34 @@ export class CloudRuntime {
             'admin_required',
             'Only workspace owners and admins can change this setting.',
           );
+        if (name === 'backup.export' || name === 'backup.restore') {
+          const backup = z
+            .object({
+              password: z.string().min(12).max(10000),
+              path: z.string().optional(),
+              directory: z.string().optional(),
+            })
+            .parse(payload);
+          if (name === 'backup.export') {
+            requireCondition(
+              backup.directory === 'cloud-downloads',
+              400,
+              'download_target_invalid',
+              'Use the browser download destination.',
+            );
+            return (await exportCloudArchive(context, backup.password)) as CommandResultMap[K];
+          }
+          const restored = await restoreCloudArchive(
+            context,
+            z.string().parse(backup.path),
+            backup.password,
+          );
+          return {
+            ...restored,
+            hosting: 'cloud',
+            vaultPath: 'Cloud workspace',
+          } as CommandResultMap[K];
+        }
         const files = new FileStore(client);
         let input = payload;
         if (FILE_COMMANDS.has(name)) {
@@ -310,8 +345,31 @@ export class CloudRuntime {
             input = { ...value, directory };
           }
         }
-        let result = await command.execute(name, input);
-        if (name === 'data.exportCsv' || name === 'backup.export') {
+        // Validate a document reference before persisting it. New uploads expire unless linked.
+        const document =
+          name === 'knowledge.save'
+            ? z
+                .object({ content: z.string() })
+                .parse(input)
+                .content.match(/^file:(cloud-file:[0-9a-f-]{36})$/)?.[1]
+            : undefined;
+        if (document) {
+          const file = await files.get(session.userId, orgId, document);
+          requireCondition(
+            file.purpose === 'upload' &&
+              (file.user_id === session.userId || file.expires_at === null),
+            403,
+            'document_upload_required',
+            'Choose your own upload or an existing workspace document.',
+          );
+        }
+        let result = document
+          ? await transaction(client, async () => {
+              await files.retain(session.userId, orgId, document);
+              return command.execute(name, input);
+            })
+          : await command.execute(name, input);
+        if (name === 'data.exportCsv') {
           const output = result as { path: string };
           result = {
             path: await files.capture(session.userId, orgId, output.path),

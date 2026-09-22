@@ -431,6 +431,7 @@ interface MessageRow {
   sender_normalized: string;
   message_kind: DraftMessage['kind'];
   provider_thread_id: string | null;
+  reply_parent_id: string | null;
   subject: string;
   body_text: string;
   attachments_json: string;
@@ -885,6 +886,7 @@ export class VaultService {
       contacted: Boolean(sent),
       replied,
       canSendInitial: Boolean(email) && !sent && !suppressed,
+      suppressed: Boolean(suppressed),
       suppressionReason:
         suppressed?.reason ??
         (sent ? 'An initial message is already recorded for this canonical person.' : null),
@@ -1279,6 +1281,7 @@ export class VaultService {
           ? (String(row.kind) as MailEventItem['kind'])
           : 'message',
         subject: sqlText(row.subject),
+        threadId: typeof row.provider_thread_id === 'string' ? row.provider_thread_id : null,
         occurredAt: String(row.occurred_at),
         reviewedAt: typeof row.reviewed_at === 'string' ? row.reviewed_at : null,
       }));
@@ -1398,15 +1401,14 @@ export class VaultService {
         'Link this draft to one canonical person before approval so lifetime deduplication is enforceable.',
       );
     }
-    if (person?.suppressionReason) approvalBlockReasons.push(person.suppressionReason);
+    if (
+      person?.suppressionReason &&
+      (message.message_kind === 'initial' || person.suppressed !== false)
+    )
+      approvalBlockReasons.push(person.suppressionReason);
 
     const policy = this.#communicationPolicy();
     const sendBlockReasons = [...approvalBlockReasons];
-    if (message.message_kind !== 'initial') {
-      sendBlockReasons.push(
-        'Stock Outreachr 0.1 sends initial outreach only; keep this message local for review.',
-      );
-    }
     if (policy.sendingPaused)
       sendBlockReasons.push('All sending is paused in Communication safety.');
     if (policy.reservedToday >= policy.dailySendLimit) {
@@ -1558,6 +1560,7 @@ export class VaultService {
             senderAddress: message.sender_address,
             messageKind: message.message_kind,
             providerThreadId: message.provider_thread_id,
+            replyParentId: message.reply_parent_id,
             subject: message.subject,
             bodyText: message.body_text,
             attachments: JSON.parse(message.attachments_json),
@@ -2241,8 +2244,9 @@ export class VaultService {
         id: string;
         provider: string;
         provider_thread_id: string | null;
+        account_email: string;
       }>(
-        `SELECT id,provider,provider_thread_id FROM mail_events
+        `SELECT id,provider,account_email,provider_thread_id FROM mail_events
          WHERE person_id IS NULL AND (
            (direction='outbound' AND EXISTS (
              SELECT 1 FROM json_each(mail_events.recipient_addresses_json)
@@ -2256,8 +2260,8 @@ export class VaultService {
         for (const match of directMatches) {
           if (!match.provider_thread_id) continue;
           for (const threaded of this.#vault.all<{ id: string }>(
-            'SELECT id FROM mail_events WHERE person_id IS NULL AND provider=? AND provider_thread_id=?',
-            [match.provider, match.provider_thread_id],
+            'SELECT id FROM mail_events WHERE person_id IS NULL AND provider=? AND account_email=? AND provider_thread_id=?',
+            [match.provider, match.account_email, match.provider_thread_id],
           )) {
             ids.add(threaded.id);
           }
@@ -2535,6 +2539,7 @@ export class VaultService {
   async importCalendarEvents(
     provider: 'google' | 'microsoft',
     events: readonly CalendarEvent[],
+    accountEmail: string,
   ): Promise<AppBootstrap> {
     const now = this.#now().toISOString();
     const round = this.#roundRow();
@@ -2542,7 +2547,7 @@ export class VaultService {
     try {
       for (const event of events) {
         if (!event.id) continue;
-        const externalCalendarId = `${provider}:${event.id}`;
+        const externalCalendarId = `${provider}:${accountEmail.trim().toLowerCase()}:${event.id}`;
         const existing = this.#vault.one<Record<string, unknown>>(
           'SELECT * FROM meetings WHERE external_calendar_id=?',
           [externalCalendarId],
@@ -2595,7 +2600,7 @@ export class VaultService {
           id:
             typeof existing?.id === 'string'
               ? existing.id
-              : `meeting:${provider}:${createHash('sha256').update(event.id).digest('hex').slice(0, 24)}`,
+              : `meeting:${provider}:${createHash('sha256').update(externalCalendarId).digest('hex').slice(0, 24)}`,
           roundId:
             typeof existing?.round_id === 'string'
               ? existing.round_id
@@ -2673,8 +2678,8 @@ export class VaultService {
           }))
           .filter((recipient) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(recipient.email));
         const existingEvent = this.#vault.one<{ direction: 'inbound' | 'outbound' }>(
-          'SELECT direction FROM mail_events WHERE provider=? AND provider_message_id=?',
-          [provider, message.id],
+          'SELECT direction FROM mail_events WHERE provider=? AND account_email=? AND provider_message_id=?',
+          [provider, account, message.id],
         );
         // Only provider context is authoritative for outbound. In particular,
         // a send-as alias need not equal the connected mailbox account.
@@ -2702,14 +2707,15 @@ export class VaultService {
         }
         if (!personId && message.threadId) {
           const candidate = this.#vault.scalar(
-            'SELECT person_id FROM mail_events WHERE provider=? AND provider_thread_id=? AND person_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1',
-            [provider, message.threadId],
+            'SELECT person_id FROM mail_events WHERE provider=? AND account_email=? AND provider_thread_id=? AND person_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1',
+            [provider, account, message.threadId],
           );
           if (typeof candidate === 'string') personId = candidate;
         }
         if (message.direction === 'outbound' && message.operationKey) {
           this.#repository.reconcileUnconfirmedSendFromMailbox({
             operationKey: message.operationKey,
+            senderAddress: account,
             provider,
             providerMessageId: message.id,
             providerThreadId: message.threadId ?? null,
@@ -2742,18 +2748,18 @@ export class VaultService {
                     ? 'hard_bounce'
                     : 'bounce'
                   : 'reply';
-        const id = `mail:${provider}:${createHash('sha256').update(message.id).digest('hex').slice(0, 32)}`;
+        const id = `mail:${provider}:${createHash('sha256').update(`${account}:${message.id}`).digest('hex').slice(0, 32)}`;
         const existing = this.#vault.scalar(
-          'SELECT 1 FROM mail_events WHERE provider=? AND provider_message_id=?',
-          [provider, message.id],
+          'SELECT 1 FROM mail_events WHERE provider=? AND account_email=? AND provider_message_id=?',
+          [provider, account, message.id],
         );
         this.#vault.run(
           `INSERT INTO mail_events(
-          id,provider,provider_message_id,provider_thread_id,internet_message_id,person_id,
+          id,provider,provider_message_id,account_email,provider_thread_id,internet_message_id,person_id,
           direction,kind,sender_address,recipient_addresses_json,subject,occurred_at,
           metadata_json,reviewed_at,created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
-        ON CONFLICT(provider,provider_message_id) DO UPDATE SET
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+        ON CONFLICT(provider,account_email,provider_message_id) DO UPDATE SET
           provider_thread_id=COALESCE(excluded.provider_thread_id,mail_events.provider_thread_id),
           internet_message_id=COALESCE(excluded.internet_message_id,mail_events.internet_message_id),
           person_id=COALESCE(mail_events.person_id,excluded.person_id),
@@ -2764,6 +2770,7 @@ export class VaultService {
             id,
             provider,
             message.id,
+            account,
             message.threadId ?? null,
             message.internetMessageId ?? null,
             personId,
@@ -2794,9 +2801,9 @@ export class VaultService {
         if (message.threadId) {
           this.#vault.run(
             `UPDATE send_ledger SET provider_thread_id=COALESCE(provider_thread_id,?)
-           WHERE id=(SELECT id FROM send_ledger WHERE provider=? AND recipient_person_id=?
+           WHERE id=(SELECT id FROM send_ledger WHERE provider=? AND sender_normalized=? AND recipient_person_id=?
              ORDER BY reserved_at DESC LIMIT 1)`,
-            [message.threadId, provider, personId],
+            [message.threadId, provider, account, personId],
           );
         }
       }
@@ -2926,6 +2933,23 @@ export class VaultService {
     });
     await this.persist();
     return this.#suppressions().find((item) => item.id === id)!;
+  }
+
+  async removeKnowledge(id: string): Promise<{ success: true }> {
+    this.#vault.transaction(() => {
+      this.#vault.run('DELETE FROM knowledge_items WHERE id=?', [id]);
+      appendAuditEntry(this.#vault, {
+        occurredAt: this.#now().toISOString(),
+        actorType: 'founder',
+        actorId: this.#options.actorId ?? 'founder',
+        action: 'knowledge.removed',
+        entityType: 'knowledge',
+        entityId: id,
+        detail: {},
+      });
+    });
+    await this.persist();
+    return { success: true };
   }
 
   async saveKnowledge(
@@ -3072,6 +3096,16 @@ export class VaultService {
           optOutText: policy.optOutText,
         })
       : input.bodyText;
+    const parent =
+      input.kind === 'follow_up' || input.kind === 'reply'
+        ? this.#repository.conversationParent({
+            provider: input.provider,
+            threadId: input.threadId ?? null,
+            senderAddress,
+            recipientAddress: person.email,
+            personId: person.id,
+          })
+        : null;
     this.#repository.createMessageDraft({
       id,
       roundId: round ? String(round.id) : null,
@@ -3082,6 +3116,7 @@ export class VaultService {
       senderAddress,
       messageKind: input.kind,
       providerThreadId: input.threadId ?? null,
+      replyParentId: parent?.internetMessageId ?? null,
       subject: input.subject,
       bodyText,
       attachments: [],
@@ -3119,6 +3154,7 @@ export class VaultService {
       senderAddress: row.sender_address,
       messageKind: row.message_kind,
       providerThreadId: row.provider_thread_id,
+      replyParentId: row.reply_parent_id,
       subject: values.subject ?? row.subject,
       bodyText: values.bodyText ?? row.body_text,
       attachments,
@@ -3172,6 +3208,11 @@ export class VaultService {
   async restoreBackup(path: string, password: string): Promise<AppBootstrap> {
     const encryptedBytes = await readBoundedFile(path, MAX_VAULT_OR_BACKUP_BYTES, 'Backup');
     const bytes = await restoreEncryptedBackup(encryptedBytes, password);
+    return this.restoreSnapshot(bytes);
+  }
+
+  /** Validates a complete snapshot before replacing the current vault. */
+  async restoreSnapshot(bytes: Uint8Array): Promise<AppBootstrap> {
     const packagedWasmPath = join(this.#options.resourceDirectory, 'sql-wasm.wasm');
     let wasmPath: string | undefined;
     try {

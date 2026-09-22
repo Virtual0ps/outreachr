@@ -1,4 +1,6 @@
 /** Starts the cloud BFF with explicit credentials and an already-migrated database. */
+import { MailboxWorker } from './mailbox-worker';
+import { FileStore } from './files';
 import { serve } from '@hono/node-server';
 import { Pool } from 'pg';
 import { z } from 'zod';
@@ -122,6 +124,39 @@ const drainMemberships = async () => {
     syncingMemberships = false;
   }
 };
+const mailboxWorker = new MailboxWorker(pool, sessions, runtime, env.ELIZA_PRODUCT_FAMILY_KEY);
+let syncingMailboxes = false;
+const mailboxTimer = setInterval(() => {
+  if (syncingMailboxes) return;
+  syncingMailboxes = true;
+  void mailboxWorker
+    .runPending()
+    .catch(() => process.stderr.write('Mailbox reconciliation failed.\n'))
+    .finally(() => {
+      syncingMailboxes = false;
+    });
+}, 60_000);
+mailboxTimer.unref();
+let cleaning = false;
+const cleanupTimer = setInterval(() => {
+  if (cleaning) return;
+  cleaning = true;
+  void (async () => {
+    await new FileStore(pool).cleanup();
+    await pool.query('DELETE FROM outreachr.request_buckets WHERE window_start < $1', [
+      Math.floor(Date.now() / 60000) - 10,
+    ]);
+    await pool.query('DELETE FROM outreachr.login_states WHERE expires_at < now()');
+    await pool.query('DELETE FROM outreachr.sessions WHERE expires_at < now()');
+  })()
+    .catch(() => {
+      process.stderr.write('Expired workspace resource cleanup failed.\n');
+    })
+    .finally(() => {
+      cleaning = false;
+    });
+}, 60_000);
+cleanupTimer.unref();
 const membershipTimer = setInterval(() => {
   void drainMemberships();
 }, 15_000);
@@ -130,7 +165,9 @@ void drainMemberships();
 process.stdout.write(`Outreachr cloud listening on port ${env.PORT}, revision ${revision}.\n`);
 for (const signal of ['SIGINT', 'SIGTERM'] as const)
   process.once(signal, () => {
+    clearInterval(mailboxTimer);
     clearInterval(membershipTimer);
+    clearInterval(cleanupTimer);
     server.close(() => {
       void pool.end().then(() => process.exit(0));
     });

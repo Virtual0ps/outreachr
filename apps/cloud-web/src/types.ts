@@ -1,4 +1,5 @@
 export interface Organization {
+  archived_at?: string | null;
   id: string;
   name: string;
   role: 'owner' | 'admin' | 'member' | 'viewer';
@@ -24,6 +25,6 @@ export interface Organization {
   };
 }
 export interface Account {
-  user: { id: string; email: string; name: string; defaultOrgId: string };
+  user: { id: string; email: string; name: string; defaultOrgId: string | null };
   organizations: Organization[];
 }

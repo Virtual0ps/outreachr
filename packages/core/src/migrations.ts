@@ -1,6 +1,6 @@
 import type { Database } from 'sql.js';
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 12;
 
 export interface Migration {
   readonly version: number;
@@ -1139,6 +1139,224 @@ CREATE TABLE local_preferences (
   value_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+`,
+  },
+  {
+    version: 10,
+    name: 'reviewed_threaded_conversations',
+    sql: `
+ALTER TABLE messages ADD COLUMN reply_parent_id TEXT;
+UPDATE approvals SET status='revoked',revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status='active';
+UPDATE messages SET state='draft' WHERE state='approved';
+CREATE TRIGGER messages_reply_parent_changed
+AFTER UPDATE OF reply_parent_id ON messages
+WHEN COALESCE(OLD.reply_parent_id,'')!=COALESCE(NEW.reply_parent_id,'')
+BEGIN
+  UPDATE approvals SET status='revoked',revoked_at=NEW.updated_at WHERE message_id=NEW.id AND status='active';
+  UPDATE messages SET state='draft' WHERE id=NEW.id AND state='approved';
+END;
+DROP INDEX send_ledger_recipient_address_once_idx;
+DROP INDEX send_ledger_recipient_person_once_idx;
+CREATE UNIQUE INDEX send_ledger_recipient_address_once_idx ON send_ledger(recipient_normalized)
+  WHERE COALESCE(message_kind,'initial') NOT IN ('follow_up','reply');
+CREATE UNIQUE INDEX send_ledger_recipient_person_once_idx ON send_ledger(recipient_person_id)
+  WHERE COALESCE(message_kind,'initial') NOT IN ('follow_up','reply');
+DROP TRIGGER send_ledger_allows_initial_only;
+DROP TRIGGER send_ledger_requires_visible_compliance_footer;
+CREATE TRIGGER send_ledger_requires_visible_compliance_footer
+BEFORE INSERT ON send_ledger
+BEGIN
+  SELECT CASE WHEN COALESCE(NEW.message_kind,'') NOT IN ('initial','follow_up','reply')
+    THEN RAISE(ABORT,'unsupported outbound message kind') END;
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM messages m,communication_settings c WHERE m.id=NEW.message_id AND c.id='global'
+      AND length(trim(COALESCE(c.postal_address,'')))>0 AND length(trim(c.opt_out_text))>0
+      AND instr(m.body_text,c.postal_address)>0 AND instr(m.body_text,c.opt_out_text)>0
+      AND json_valid(m.attachments_json) AND json_type(m.attachments_json)='array'
+      AND json_array_length(m.attachments_json)=0
+      AND (m.message_kind!='initial' OR (m.provider_thread_id IS NULL AND m.reply_parent_id IS NULL))
+  ) THEN RAISE(ABORT,'message requires the exact configured compliance footer and no attachments; initial outreach must be unthreaded') END;
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM send_ledger WHERE (recipient_person_id=NEW.recipient_person_id OR recipient_normalized=NEW.recipient_normalized)
+      AND dispatch_status IN ('reserved','dispatching','ambiguous')
+  ) THEN RAISE(ABORT,'reconcile the pending send before further contact') END;
+END;
+DROP TRIGGER send_ledger_blocks_synced_prior_outreach;
+CREATE TRIGGER send_ledger_blocks_synced_prior_outreach
+BEFORE INSERT ON send_ledger WHEN NEW.message_kind='initial'
+BEGIN
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM mail_events WHERE direction='outbound' AND (
+      person_id=NEW.recipient_person_id OR EXISTS (
+        SELECT 1 FROM json_each(recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=NEW.recipient_normalized
+      )
+    )
+  ) OR EXISTS (
+    SELECT 1 FROM send_ledger WHERE message_kind IN ('follow_up','reply')
+      AND (recipient_person_id=NEW.recipient_person_id OR recipient_normalized=NEW.recipient_normalized)
+  ) THEN RAISE(ABORT,'prior outbound history blocks another initial') END;
+END;
+CREATE TRIGGER send_ledger_requires_verified_reply_parent
+BEFORE INSERT ON send_ledger WHEN NEW.message_kind IN ('follow_up','reply')
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM messages m JOIN mail_events e ON e.internet_message_id=m.reply_parent_id
+      AND e.provider=m.provider AND e.provider_thread_id=m.provider_thread_id
+      AND e.person_id=m.recipient_person_id
+    WHERE m.id=NEW.message_id AND m.provider='google'
+      AND lower(json_extract(e.metadata_json,'$.accountEmail'))=m.sender_normalized
+      AND e.kind IN ('message','reply')
+      AND ((lower(e.sender_address)=m.sender_normalized AND EXISTS (
+        SELECT 1 FROM json_each(e.recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=m.recipient_normalized
+      )) OR (lower(e.sender_address)=m.recipient_normalized AND EXISTS (
+        SELECT 1 FROM json_each(e.recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=m.sender_normalized
+      )))
+  ) THEN RAISE(ABORT,'reply requires a verified Gmail thread belonging to this mailbox and recipient') END;
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM send_ledger l JOIN messages prior ON prior.id=l.message_id JOIN messages m ON m.id=NEW.message_id
+    WHERE l.recipient_person_id=NEW.recipient_person_id AND l.provider=NEW.provider
+      AND l.sender_normalized=NEW.sender_normalized AND prior.reply_parent_id=m.reply_parent_id
+      AND l.dispatch_status!='failed_pre_dispatch'
+  ) THEN RAISE(ABORT,'this conversation message already has an approved send; sync before another follow-up') END;
+END;
+`,
+  },
+  {
+    version: 11,
+    name: 'durable_calendar_operations',
+    sql: `
+CREATE TABLE calendar_operations (
+  operation_key TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('google','microsoft')),
+  account_email TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  event_json TEXT,
+  state TEXT NOT NULL CHECK(state IN ('dispatching','completed','ambiguous','failed_safe')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
+  {
+    version: 12,
+    name: 'mailbox_scoped_provider_identifiers',
+    sql: `
+DROP TRIGGER send_ledger_blocks_synced_prior_outreach;
+DROP TRIGGER send_ledger_requires_verified_reply_parent;
+DROP TRIGGER mail_event_creates_automatic_suppression_insert;
+DROP TRIGGER mail_event_creates_automatic_suppression_update;
+CREATE TABLE mail_events_v12 (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK(provider IN ('google','microsoft')),
+  provider_message_id TEXT NOT NULL,
+  account_email TEXT NOT NULL DEFAULT '',
+  provider_thread_id TEXT,
+  internet_message_id TEXT,
+  person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+  direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
+  kind TEXT NOT NULL CHECK(kind IN ('message','reply','bounce','hard_bounce','complaint','unsubscribe')),
+  sender_address TEXT NOT NULL,
+  recipient_addresses_json TEXT NOT NULL DEFAULT '[]',
+  subject TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(provider,account_email,provider_message_id)
+);
+INSERT INTO mail_events_v12(
+  id,provider,provider_message_id,account_email,provider_thread_id,internet_message_id,person_id,
+  direction,kind,sender_address,recipient_addresses_json,subject,occurred_at,
+  metadata_json,reviewed_at,created_at
+)
+SELECT id,provider,provider_message_id,lower(COALESCE(json_extract(metadata_json,'$.accountEmail'),'')),provider_thread_id,internet_message_id,person_id,
+  direction,kind,sender_address,recipient_addresses_json,subject,occurred_at,
+  metadata_json,reviewed_at,created_at
+FROM mail_events;
+DROP TABLE mail_events;
+ALTER TABLE mail_events_v12 RENAME TO mail_events;
+CREATE INDEX mail_events_person_time_idx ON mail_events(person_id,occurred_at DESC);
+CREATE INDEX mail_events_thread_idx ON mail_events(provider,account_email,provider_thread_id);
+DROP INDEX send_ledger_provider_message_idx;
+CREATE UNIQUE INDEX send_ledger_provider_message_idx ON send_ledger(provider,sender_normalized,provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE TRIGGER send_ledger_blocks_synced_prior_outreach
+BEFORE INSERT ON send_ledger WHEN NEW.message_kind='initial'
+BEGIN
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM mail_events WHERE direction='outbound' AND (
+      person_id=NEW.recipient_person_id OR EXISTS (
+        SELECT 1 FROM json_each(recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=NEW.recipient_normalized
+      )
+    )
+  ) OR EXISTS (
+    SELECT 1 FROM send_ledger WHERE message_kind IN ('follow_up','reply')
+      AND (recipient_person_id=NEW.recipient_person_id OR recipient_normalized=NEW.recipient_normalized)
+  ) THEN RAISE(ABORT,'prior outbound history blocks another initial') END;
+END;
+
+CREATE TRIGGER send_ledger_requires_verified_reply_parent
+BEFORE INSERT ON send_ledger WHEN NEW.message_kind IN ('follow_up','reply')
+BEGIN
+  SELECT CASE WHEN NOT EXISTS (
+    SELECT 1 FROM messages m JOIN mail_events e ON e.internet_message_id=m.reply_parent_id
+      AND e.provider=m.provider AND e.provider_thread_id=m.provider_thread_id
+      AND e.person_id=m.recipient_person_id
+    WHERE m.id=NEW.message_id AND m.provider='google'
+      AND lower(json_extract(e.metadata_json,'$.accountEmail'))=m.sender_normalized
+      AND e.kind IN ('message','reply')
+      AND ((lower(e.sender_address)=m.sender_normalized AND EXISTS (
+        SELECT 1 FROM json_each(e.recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=m.recipient_normalized
+      )) OR (lower(e.sender_address)=m.recipient_normalized AND EXISTS (
+        SELECT 1 FROM json_each(e.recipient_addresses_json) WHERE lower(json_extract(value,'$.email'))=m.sender_normalized
+      )))
+  ) THEN RAISE(ABORT,'reply requires a verified Gmail thread belonging to this mailbox and recipient') END;
+  SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM send_ledger l JOIN messages prior ON prior.id=l.message_id JOIN messages m ON m.id=NEW.message_id
+    WHERE l.recipient_person_id=NEW.recipient_person_id AND l.provider=NEW.provider
+      AND l.sender_normalized=NEW.sender_normalized AND prior.reply_parent_id=m.reply_parent_id
+      AND l.dispatch_status!='failed_pre_dispatch'
+  ) THEN RAISE(ABORT,'this conversation message already has an approved send; sync before another follow-up') END;
+END;
+
+CREATE TRIGGER mail_event_creates_automatic_suppression_insert
+AFTER INSERT ON mail_events
+WHEN NEW.person_id IS NOT NULL AND NEW.kind IN ('hard_bounce','complaint','unsubscribe')
+BEGIN
+  INSERT INTO suppressions(id,scope,value,normalized_value,reason,source,active,created_at,updated_at)
+  VALUES (
+    'suppression:mail:' || NEW.provider || ':' || NEW.account_email || ':' || NEW.provider_message_id,
+    'person',NEW.person_id,NEW.person_id,
+    CASE NEW.kind
+      WHEN 'hard_bounce' THEN 'Provider mailbox reported a hard bounce.'
+      WHEN 'unsubscribe' THEN 'The recipient requested no further email.'
+      ELSE 'Provider mailbox reported a complaint.'
+    END,
+    CASE NEW.kind WHEN 'hard_bounce' THEN 'bounce' WHEN 'unsubscribe' THEN 'unsubscribe' ELSE 'complaint' END,
+    1,NEW.created_at,NEW.created_at
+  )
+  ON CONFLICT(scope,normalized_value) DO UPDATE SET
+    reason=excluded.reason,source=excluded.source,active=1,updated_at=excluded.updated_at;
+END;
+
+CREATE TRIGGER mail_event_creates_automatic_suppression_update
+AFTER UPDATE OF person_id,kind ON mail_events
+WHEN NEW.person_id IS NOT NULL AND NEW.kind IN ('hard_bounce','complaint','unsubscribe')
+BEGIN
+  INSERT INTO suppressions(id,scope,value,normalized_value,reason,source,active,created_at,updated_at)
+  VALUES (
+    'suppression:mail:' || NEW.provider || ':' || NEW.account_email || ':' || NEW.provider_message_id,
+    'person',NEW.person_id,NEW.person_id,
+    CASE NEW.kind
+      WHEN 'hard_bounce' THEN 'Provider mailbox reported a hard bounce.'
+      WHEN 'unsubscribe' THEN 'The recipient requested no further email.'
+      ELSE 'Provider mailbox reported a complaint.'
+    END,
+    CASE NEW.kind WHEN 'hard_bounce' THEN 'bounce' WHEN 'unsubscribe' THEN 'unsubscribe' ELSE 'complaint' END,
+    1,NEW.created_at,NEW.created_at
+  )
+  ON CONFLICT(scope,normalized_value) DO UPDATE SET
+    reason=excluded.reason,source=excluded.source,active=1,updated_at=excluded.updated_at;
+END;
 `,
   },
 ] as const;

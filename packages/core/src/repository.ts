@@ -110,6 +110,7 @@ const MailboxSendReconciliationSchema = z.object({
     message: 'Mailbox send operation keys must use the send: namespace',
   }),
   provider: z.enum(['google', 'microsoft']),
+  senderAddress: z.string().trim().email().max(320),
   providerMessageId: z.string().trim().min(1).max(4_096),
   providerThreadId: z.string().trim().min(1).max(4_096).nullable().default(null),
   recipientAddresses: z.array(z.string().trim().email().max(320)).min(1).max(500),
@@ -339,19 +340,21 @@ export function approvalContentHash(message: {
   senderAddress: string;
   messageKind: 'initial' | 'follow_up' | 'intro_request' | 'reply';
   providerThreadId?: string | null;
+  replyParentId?: string | null;
   subject: string;
   bodyText: string;
   attachments: unknown;
 }): string {
   return sha256(
     stableJson({
-      version: 2,
+      version: 3,
       recipientAddress: normalizeEmail(message.recipientAddress),
       recipientPersonId: message.recipientPersonId ?? null,
       provider: message.provider,
       senderAddress: normalizeEmail(message.senderAddress),
       messageKind: message.messageKind,
       providerThreadId: message.providerThreadId?.trim() || null,
+      replyParentId: message.replyParentId ?? null,
       subject: message.subject,
       bodyText: message.bodyText,
       attachments: message.attachments,
@@ -473,15 +476,82 @@ export class OutreachrRepository {
     });
   }
 
+  /** Resolve only a reconciled conversation for the exact mailbox and canonical recipient. */
+  conversationParent(input: {
+    provider: string;
+    threadId: string | null;
+    senderAddress: string;
+    recipientAddress: string;
+    personId: string | null;
+    parentId?: string | null;
+  }): { internetMessageId: string; subject: string } {
+    if (input.provider !== 'google' || !input.threadId || !input.personId)
+      throw new Error('Follow-ups and replies require a synchronized Gmail conversation.');
+    const sender = normalizeEmail(input.senderAddress);
+    const recipient = normalizeEmail(input.recipientAddress);
+    const events = this.vault.all<{
+      internet_message_id: string | null;
+      subject: string;
+      sender_address: string;
+      recipient_addresses_json: string;
+      metadata_json: string;
+    }>(
+      `SELECT internet_message_id,subject,sender_address,recipient_addresses_json,metadata_json
+       FROM mail_events WHERE provider=? AND provider_thread_id=? AND person_id=?
+       AND kind IN ('message','reply') AND (? IS NULL OR internet_message_id=?)
+       ORDER BY occurred_at DESC,id DESC`,
+      [
+        input.provider,
+        input.threadId,
+        input.personId,
+        input.parentId ?? null,
+        input.parentId ?? null,
+      ],
+    );
+    for (const event of events) {
+      if (
+        !event.internet_message_id ||
+        !/^<[^<>\s]+@[^<>\s]+>$/.test(event.internet_message_id) ||
+        event.internet_message_id.length > 1000
+      )
+        continue;
+      const metadata = JSON.parse(event.metadata_json) as { accountEmail?: string };
+      const recipients = JSON.parse(event.recipient_addresses_json) as Array<{ email?: string }>;
+      if (
+        typeof metadata.accountEmail !== 'string' ||
+        normalizeEmail(metadata.accountEmail) !== sender
+      )
+        continue;
+      const from = normalizeEmail(event.sender_address);
+      const addresses = recipients.flatMap((item) =>
+        typeof item.email === 'string' ? [normalizeEmail(item.email)] : [],
+      );
+      if (
+        (from === sender && addresses.includes(recipient)) ||
+        (from === recipient && addresses.includes(sender))
+      )
+        return { internetMessageId: event.internet_message_id, subject: event.subject };
+    }
+    throw new Error(
+      'Sync this mailbox before replying; no verified conversation for this recipient was found.',
+    );
+  }
+
   messageComplianceIssues(messageId: string): string[] {
     IdSchema.parse(messageId);
     const message = this.vault.one<{
+      provider: string;
+      sender_address: string;
+      recipient_address: string;
+      recipient_person_id: string | null;
+      subject: string;
+      reply_parent_id: string | null;
       message_kind: string | null;
       provider_thread_id: string | null;
       body_text: string;
       attachments_json: string;
     }>(
-      'SELECT message_kind,provider_thread_id,body_text,attachments_json FROM messages WHERE id=?',
+      'SELECT provider,sender_address,recipient_address,recipient_person_id,subject,reply_parent_id,message_kind,provider_thread_id,body_text,attachments_json FROM messages WHERE id=?',
       [messageId],
     );
     if (!message) return [`Message ${messageId} does not exist`];
@@ -497,8 +567,40 @@ export class OutreachrRepository {
     } else if (!message.body_text.includes(policy.optOutText)) {
       issues.push('The message body must include the exact configured opt-out wording.');
     }
-    if (message.message_kind === 'initial' && message.provider_thread_id) {
+    if (
+      message.message_kind === 'initial' &&
+      (message.provider_thread_id || message.reply_parent_id)
+    ) {
       issues.push('Initial outreach must not be attached to an existing provider thread.');
+    }
+    if (message.message_kind === 'follow_up' || message.message_kind === 'reply') {
+      try {
+        if (!message.reply_parent_id)
+          throw new Error(
+            'A verified reply parent is required. Sync the mailbox and create a new conversation draft.',
+          );
+        const parent = this.conversationParent({
+          provider: message.provider,
+          threadId: message.provider_thread_id,
+          senderAddress: message.sender_address,
+          recipientAddress: message.recipient_address,
+          personId: message.recipient_person_id,
+          parentId: message.reply_parent_id,
+        });
+        const subject = (value: string) =>
+          value
+            .replace(/^(?:re:\s*)+/i, '')
+            .trim()
+            .toLowerCase();
+        if (subject(message.subject) !== subject(parent.subject))
+          issues.push('Keep the conversation subject unchanged when replying.');
+      } catch (error) {
+        issues.push(error instanceof Error ? error.message : 'Conversation could not be verified.');
+      }
+    } else if (message.message_kind !== 'initial') {
+      issues.push(
+        'Prepare an introduction request as a reviewed initial message or conversation reply.',
+      );
     }
     let attachments: unknown;
     try {
@@ -506,8 +608,8 @@ export class OutreachrRepository {
     } catch {
       issues.push('The draft attachment manifest is invalid.');
     }
-    if (message.message_kind === 'initial' && (!Array.isArray(attachments) || attachments.length)) {
-      issues.push('Initial outreach cannot include attachments.');
+    if (!Array.isArray(attachments) || attachments.length) {
+      issues.push('Messages cannot include attachments. Share an approved document link instead.');
     }
     return issues;
   }
@@ -805,11 +907,11 @@ export class OutreachrRepository {
     const value = MessageDraftSchema.parse(input);
     const normalized = normalizeEmail(value.recipientAddress);
     this.vault.run(
-      `INSERT INTO messages(id,round_id,target_id,recipient_person_id,recipient_address,recipient_normalized,provider,sender_address,sender_normalized,message_kind,provider_thread_id,subject,body_text,attachments_json,state,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?) ON CONFLICT(id) DO UPDATE SET round_id=excluded.round_id,target_id=excluded.target_id,
+      `INSERT INTO messages(id,round_id,target_id,recipient_person_id,recipient_address,recipient_normalized,provider,sender_address,sender_normalized,message_kind,provider_thread_id,reply_parent_id,subject,body_text,attachments_json,state,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?) ON CONFLICT(id) DO UPDATE SET round_id=excluded.round_id,target_id=excluded.target_id,
       recipient_person_id=excluded.recipient_person_id,recipient_address=excluded.recipient_address,recipient_normalized=excluded.recipient_normalized,
       provider=excluded.provider,sender_address=excluded.sender_address,sender_normalized=excluded.sender_normalized,
-      message_kind=excluded.message_kind,provider_thread_id=excluded.provider_thread_id,
+      message_kind=excluded.message_kind,provider_thread_id=excluded.provider_thread_id,reply_parent_id=excluded.reply_parent_id,
       subject=excluded.subject,body_text=excluded.body_text,attachments_json=excluded.attachments_json,updated_at=excluded.updated_at`,
       [
         value.id,
@@ -823,6 +925,7 @@ export class OutreachrRepository {
         normalizeEmail(value.senderAddress),
         value.messageKind,
         value.providerThreadId,
+        value.replyParentId,
         value.subject,
         value.bodyText,
         stableJson(value.attachments),
@@ -860,11 +963,12 @@ export class OutreachrRepository {
       sender_normalized: string | null;
       message_kind: 'initial' | 'follow_up' | 'intro_request' | 'reply' | null;
       provider_thread_id: string | null;
+      reply_parent_id: string | null;
       subject: string;
       body_text: string;
       attachments_json: string;
     }>(
-      'SELECT id,recipient_address,recipient_person_id,provider,sender_address,sender_normalized,message_kind,provider_thread_id,subject,body_text,attachments_json FROM messages WHERE id=?',
+      'SELECT id,recipient_address,recipient_person_id,provider,sender_address,sender_normalized,message_kind,provider_thread_id,reply_parent_id,subject,body_text,attachments_json FROM messages WHERE id=?',
       [messageId],
     );
     if (!message) throw new Error(`Message ${messageId} does not exist`);
@@ -891,6 +995,7 @@ export class OutreachrRepository {
       senderAddress: message.sender_address,
       messageKind: message.message_kind,
       providerThreadId: message.provider_thread_id,
+      replyParentId: message.reply_parent_id,
       subject: message.subject,
       bodyText: message.body_text,
       attachments,
@@ -1004,11 +1109,12 @@ export class OutreachrRepository {
       sender_normalized: string | null;
       message_kind: 'initial' | 'follow_up' | 'intro_request' | 'reply' | null;
       provider_thread_id: string | null;
+      reply_parent_id: string | null;
       subject: string;
       body_text: string;
       attachments_json: string;
     }>(
-      'SELECT id,recipient_address,recipient_normalized,recipient_person_id,provider,sender_address,sender_normalized,message_kind,provider_thread_id,subject,body_text,attachments_json FROM messages WHERE id=?',
+      'SELECT id,recipient_address,recipient_normalized,recipient_person_id,provider,sender_address,sender_normalized,message_kind,provider_thread_id,reply_parent_id,subject,body_text,attachments_json FROM messages WHERE id=?',
       [messageId],
     );
     if (!message) throw new Error(`Message ${messageId} does not exist`);
@@ -1057,6 +1163,7 @@ export class OutreachrRepository {
       senderAddress: message.sender_address,
       messageKind: message.message_kind,
       providerThreadId: message.provider_thread_id,
+      replyParentId: message.reply_parent_id,
       subject: message.subject,
       bodyText: message.body_text,
       attachments: JSON.parse(message.attachments_json),
@@ -1164,6 +1271,7 @@ export class OutreachrRepository {
   reconcileUnconfirmedSendFromMailbox(input: {
     operationKey: string;
     provider: 'google' | 'microsoft';
+    senderAddress: string;
     providerMessageId: string;
     providerThreadId?: string | null;
     recipientAddresses: readonly string[];
@@ -1176,17 +1284,24 @@ export class OutreachrRepository {
     const value = parsed.data;
     const row = this.vault.one<{
       provider: string;
+      sender_normalized: string;
       recipient_normalized: string;
       reserved_at: string;
       dispatch_status: 'dispatching' | 'ambiguous';
       subject: string;
     }>(
-      `SELECT sl.provider,sl.recipient_normalized,sl.reserved_at,sl.dispatch_status,m.subject
+      `SELECT sl.provider,sl.sender_normalized,sl.recipient_normalized,sl.reserved_at,sl.dispatch_status,m.subject
        FROM send_ledger sl JOIN messages m ON m.id=sl.message_id
        WHERE sl.id=? AND sl.dispatch_status IN ('dispatching','ambiguous')`,
       [value.operationKey],
     );
-    if (!row || row.provider !== value.provider || row.subject !== value.subject) return false;
+    if (
+      !row ||
+      row.provider !== value.provider ||
+      row.subject !== value.subject ||
+      row.sender_normalized !== normalizeEmail(value.senderAddress)
+    )
+      return false;
 
     const recipients = [...new Set(value.recipientAddresses.map(normalizeEmail))];
     if (recipients.length !== 1 || recipients[0] !== row.recipient_normalized) return false;
